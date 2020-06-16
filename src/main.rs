@@ -16,6 +16,7 @@ use tokio::task::JoinHandle;
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn Error>> {
     db_test().await
+    // gen_input().await
 }
 
 async fn db_test() -> std::result::Result<(), Box<dyn Error>> {
@@ -56,6 +57,7 @@ async fn db_test() -> std::result::Result<(), Box<dyn Error>> {
 
     //MAIN THREAD: emulate the ZMQ PULL socket (SOCKET)
 
+    // let mut file2 = File::open("input100k.txt").await?;
     let mut file2 = File::open("input100k.txt").await?;
     let reader = BufReader::new(file2);
     let mut stream = reader.lines();
@@ -72,21 +74,15 @@ async fn db_test() -> std::result::Result<(), Box<dyn Error>> {
             println!("Generating logging event -  id {}, #{}", &ie.ray_id, &i);
         }
 
+        // TODO slow the input down a little
         std::thread::sleep_ms(1);
+        // tokio::task::yield_now();
         i += 1;
         if let Err(e) = feeder_tx.send(ChannelMsg::Msg(Bytes(ie_bytes))).await {
             println!("error sending generated data to SOCKET READ thread: {}", e);
         }
     }
 
-    // for i in 0..10 {
-    //     let plaintext = recrypt.gen_plaintext();
-    //     println!("generating plaintext: {} - channel size", &i);
-    //     // if let Err(_) =
-    //     if let Err(e) = feeder_tx.send(ChannelMsg::Msg(Bytes(plaintext.bytes().to_vec()))) {
-    //         println!("error sending generated data to SOCKET READ thread: {}", e);
-    //     }
-    // }
     if let Err(e) = feeder_tx.send(ChannelMsg::Poison).await {
         println!("error sending POISON data to SOCKET READ thread: {}", e);
     }
@@ -119,6 +115,7 @@ fn create_db_thread(
     conn: Connection,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let start_time = std::time::Instant::now();
         let mut i = 0usize;
         while let Some(db_action) = db_rx.recv().await {
             match db_action {
@@ -138,7 +135,6 @@ fn create_db_thread(
                         }
                         println!("DB - ACK RECEIVED. Closing db_rx...");
                         db_rx.close();
-                        std::thread::sleep_ms(1000);
                     }
                 }
                 DbAction::Insert(le) => {
@@ -155,9 +151,19 @@ fn create_db_thread(
                         println!("Log message not send to LOG SINK thread: {}", e);
                     }
                 }
-                DbAction::Delete(ray_id) => (), //println!("DB - deleting entry for ray_id {}", ray_id)
+                DbAction::Delete(ray_id) => {
+                    conn.execute("DELETE from LOG_EVENTS where ray_id = ?1", params![ray_id])
+                        .unwrap();
+                    i += 1;
+                    if i % 100 == 0 {
+                        println!("DB - ACK {} - #{}", &ray_id, &i);
+                    }
+                } //println!("DB - deleting entry for ray_id {}", ray_id)
             }
         }
+        let end_time = std::time::Instant::now();
+        let duration = end_time - start_time;
+        println!("Test completed in {:?}", &duration);
 
         // let mut stmt = conn
         //     .prepare("SELECT id, ray_id, data FROM LOG_EVENTS")
@@ -211,7 +217,7 @@ fn create_read_socket_thread(
     })
 }
 
-fn create_rustqlite_table(conn: &Connection) -> Result<usize> {
+fn create_rustqlite_table(conn: &Connection) -> Result<()> {
     conn.execute(
         "CREATE TABLE LOG_EVENTS (
               _id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -222,13 +228,18 @@ fn create_rustqlite_table(conn: &Connection) -> Result<usize> {
               UNIQUE(ray_id, created_ms)
               )",
         params![],
-    )
+    );
+
+    // let journal_mode =
+    conn.pragma_update(None, "journal_mode", &"WAL".to_string())?;
+    // dbg!(&journal_mode);
+    Ok(())
 }
 
 pub async fn gen_input() -> std::result::Result<(), Box<dyn Error>> {
     let mut file = File::create("poem.txt").await?;
 
-    for i in 0..100000usize {
+    for i in 0..10000usize {
         let msg_len = rand::thread_rng().gen_range(250, 2500);
         let mut msg = vec![0u8; msg_len];
         rand::thread_rng().fill_bytes(&mut msg);
