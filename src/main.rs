@@ -1,11 +1,5 @@
-// use futures::prelude::*;
-// use futures::FutureExt;
-use rand::rngs::adapter::ReseedingRng;
-use rand::rngs::OsRng;
-use rand::{Rng, RngCore};
-use recrypt::api::DefaultRng;
-use recrypt::api::{Plaintext, RecryptErr};
-use recrypt::prelude::*;
+use rand::Rng;
+use rand::RngCore;
 use rusqlite::{params, Connection, Result};
 use serde::*;
 use std::error::Error;
@@ -16,7 +10,7 @@ use tokio::io::BufReader;
 use tokio::prelude::*;
 use tokio::stream::StreamExt;
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver};
+use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
 #[tokio::main]
@@ -25,12 +19,11 @@ async fn main() -> std::result::Result<(), Box<dyn Error>> {
 }
 
 async fn db_test() -> std::result::Result<(), Box<dyn Error>> {
-    let recrypt = Recrypt::new();
-    let recrypt2 = Recrypt::new();
+    let (mut feeder_tx, mut feeder_rx) = mpsc::channel(1000);
 
-    let (mut feeder_tx, mut feeder_rx) = mpsc::unbounded_channel();
-
-    let (mut db_tx, mut db_rx) = mpsc::channel(100);
+    // TODO this channel either needs to be unbounded or we need to use separate channels
+    // for ACKs and figure out how to keep deadlock from happening
+    let (mut db_tx, mut db_rx) = mpsc::unbounded_channel();
 
     let mut socket_to_db = db_tx.clone();
     let mut sink_to_db = db_tx.clone();
@@ -39,9 +32,9 @@ async fn db_test() -> std::result::Result<(), Box<dyn Error>> {
     // PURPOSE: decode bytes, create DbEvent, Send DbEvent to DB
     // IN: from SOCKET - raw bytes
     // OUT: to DB - DbEvent with id, decoded and raw bytes
-    let socket_read_thread = create_read_socket_thread(recrypt2, feeder_rx, socket_to_db);
+    let socket_read_thread = create_read_socket_thread(feeder_rx, socket_to_db);
 
-    let (mut log_sink_tx, mut log_sink_rx) = mpsc::channel(100);
+    let (mut log_sink_tx, mut log_sink_rx) = mpsc::channel(5000);
 
     let conn = Connection::open("./test.db")?;
     if let Err(e) = create_rustqlite_table(&conn) {
@@ -62,15 +55,39 @@ async fn db_test() -> std::result::Result<(), Box<dyn Error>> {
     let sink_thread = create_log_sink_thread(sink_to_db, log_sink_rx);
 
     //MAIN THREAD: emulate the ZMQ PULL socket (SOCKET)
-    for i in 0..10 {
-        let plaintext = recrypt.gen_plaintext();
-        println!("generating plaintext: {} - channel size", &i);
-        // if let Err(_) =
-        if let Err(e) = feeder_tx.send(ChannelMsg::Msg(Bytes(plaintext.bytes().to_vec()))) {
+
+    let mut file2 = File::open("input100k.txt").await?;
+    let reader = BufReader::new(file2);
+    let mut stream = reader.lines();
+
+    let mut i = 0usize;
+    while let Some(l) = stream
+        .next_line()
+        .await
+        .expect("reading from cursor won't fail")
+    {
+        let ie: InputEvent = serde_json::from_str(&l)?;
+        let ie_bytes = bincode::serialize(&ie)?;
+        if i % 1000 == 0 {
+            println!("Generating logging event -  id {}, #{}", &ie.ray_id, &i);
+        }
+
+        std::thread::sleep_ms(1);
+        i += 1;
+        if let Err(e) = feeder_tx.send(ChannelMsg::Msg(Bytes(ie_bytes))).await {
             println!("error sending generated data to SOCKET READ thread: {}", e);
         }
     }
-    if let Err(e) = feeder_tx.send(ChannelMsg::Poison) {
+
+    // for i in 0..10 {
+    //     let plaintext = recrypt.gen_plaintext();
+    //     println!("generating plaintext: {} - channel size", &i);
+    //     // if let Err(_) =
+    //     if let Err(e) = feeder_tx.send(ChannelMsg::Msg(Bytes(plaintext.bytes().to_vec()))) {
+    //         println!("error sending generated data to SOCKET READ thread: {}", e);
+    //     }
+    // }
+    if let Err(e) = feeder_tx.send(ChannelMsg::Poison).await {
         println!("error sending POISON data to SOCKET READ thread: {}", e);
     }
     tokio::join!(sink_thread, socket_read_thread, db_thread);
@@ -79,15 +96,15 @@ async fn db_test() -> std::result::Result<(), Box<dyn Error>> {
 }
 
 fn create_log_sink_thread(
-    mut sink_to_db: Sender<DbAction>,
+    mut sink_to_db: UnboundedSender<DbAction>,
     mut log_sink_rx: Receiver<ChannelMsg<LogEvent>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         println!("starting sink thread...");
         while let Some(ChannelMsg::Msg(le)) = log_sink_rx.recv().await {
-            println!("LOG SINK - SENDING {} to Stackdriver", &le.ray_id[0..5]);
+            // println!("LOG SINK - SENDING {} to Stackdriver", &le.ray_id[0..5]);
             // std::thread::sleep(Duration::from_millis(250));
-            if let Err(e) = sink_to_db.send(DbAction::Delete(le.ray_id)).await {
+            if let Err(e) = sink_to_db.send(DbAction::Delete(le.ray_id)) {
                 println!("LOG SINK - error sending ACK to db thread: {}", e);
             }
         }
@@ -97,16 +114,14 @@ fn create_log_sink_thread(
 }
 
 fn create_db_thread(
-    mut db_rx: Receiver<DbAction>,
+    mut db_rx: UnboundedReceiver<DbAction>,
     mut log_sink_tx: Sender<ChannelMsg<LogEvent>>,
     conn: Connection,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut closed_senders_count = 0u8;
-        while let Some(i) = db_rx.recv().await {
-            // println!("got = {:?}", i);
-
-            match i {
+        let mut i = 0usize;
+        while let Some(db_action) = db_rx.recv().await {
+            match db_action {
                 DbAction::Poison => {
                     println!(
                         "DB - POISON EVENT received. Waiting for final ACK to close rx channel..."
@@ -116,6 +131,7 @@ fn create_db_thread(
                         println!("DB - Failed to send POISON to LOG SINK");
                         db_rx.close();
                     } else {
+                        //TODO this logic isn't right and will result in acks being dropped
                         println!("DB - WAITING for final ACK from LOG SINK...");
                         if let Some(x) = db_rx.recv().await {
                             println!("DB - recv final ACK: {:?}", x);
@@ -126,7 +142,10 @@ fn create_db_thread(
                     }
                 }
                 DbAction::Insert(le) => {
-                    println!("DB - processing event {}", le.ray_id);
+                    i += 1;
+                    if i % 100 == 0 {
+                        println!("DB - processing event {} - #{}", le.ray_id, &i);
+                    }
                     conn.execute(
                         "INSERT INTO LOG_EVENTS (ray_id, data) VALUES (?1, ?2)",
                         params![le.ray_id, le.data],
@@ -136,7 +155,7 @@ fn create_db_thread(
                         println!("Log message not send to LOG SINK thread: {}", e);
                     }
                 }
-                DbAction::Delete(ray_id) => println!("DB - deleting entry for ray_id {}", ray_id),
+                DbAction::Delete(ray_id) => (), //println!("DB - deleting entry for ray_id {}", ray_id)
             }
         }
 
@@ -166,25 +185,17 @@ fn create_db_thread(
 }
 
 fn create_read_socket_thread(
-    recrypt2: Recrypt<Sha256, Ed25519, RandomBytes<DefaultRng>>,
-    mut feeder_rx: UnboundedReceiver<ChannelMsg<Bytes>>,
-    mut socket_to_db: Sender<DbAction>,
+    mut feeder_rx: Receiver<ChannelMsg<Bytes>>,
+    mut socket_to_db: UnboundedSender<DbAction>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(ChannelMsg::Msg(Bytes(socket_bytes))) = feeder_rx.recv().await {
-            let plaintext = Plaintext::new_from_slice(&socket_bytes).unwrap();
-            let ray_id = base64::encode_config(
-                recrypt2.random_private_key().bytes(),
-                base64::URL_SAFE_NO_PAD,
-            );
-
             let event = LogEvent {
                 id: 0,
-                ray_id,
-                plaintext,
+                ray_id: create_ray_id(),
                 data: Some(socket_bytes),
             };
-            if let Err(_) = socket_to_db.send(DbAction::Insert(event)).await {
+            if let Err(_) = socket_to_db.send(DbAction::Insert(event)) {
                 println!("receiver dropped");
                 return;
             }
@@ -194,7 +205,7 @@ fn create_read_socket_thread(
         feeder_rx.close();
         println!("SOCKET - Sending POISON to DB thread...");
 
-        if let Err(e) = socket_to_db.send(DbAction::Poison).await {
+        if let Err(e) = socket_to_db.send(DbAction::Poison) {
             println!("error sending POISON to DB thread: {}", e);
         }
     })
@@ -265,7 +276,6 @@ fn write_to_db() {}
 struct LogEvent {
     id: i64,
     ray_id: String,
-    plaintext: Plaintext,
     data: Option<Vec<u8>>,
 }
 
@@ -277,12 +287,8 @@ struct InputEvent {
 
 impl InputEvent {
     fn with_msg(m: &str) -> InputEvent {
-        let ray_id = base64::encode_config(
-            rand::thread_rng().gen::<[u8; 12]>(),
-            base64::URL_SAFE_NO_PAD,
-        );
         InputEvent {
-            ray_id,
+            ray_id: create_ray_id(),
             log_msg: m.to_string(),
         }
     }
@@ -298,6 +304,13 @@ enum DbAction {
     Insert(LogEvent),
     Delete(String),
     Poison,
+}
+
+fn create_ray_id() -> String {
+    base64::encode_config(
+        rand::thread_rng().gen::<[u8; 12]>(),
+        base64::URL_SAFE_NO_PAD,
+    )
 }
 
 struct Bytes(Vec<u8>);
