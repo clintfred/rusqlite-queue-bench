@@ -1,9 +1,13 @@
+use csv::Writer;
+use procfs::process::Process;
 use rand::Rng;
 use rand::RngCore;
 use rusqlite::{params, Connection, Result};
 use serde::*;
 use std::error::Error;
 use std::io::{BufRead, LineWriter, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs::File;
 use tokio::io::BufReader;
@@ -19,7 +23,37 @@ async fn main() -> std::result::Result<(), Box<dyn Error>> {
     // gen_input().await
 }
 
+#[derive(Serialize, Deserialize)]
+struct StatRec {
+    time: u64,
+    virtual_memory_bytes: u64,
+    resident_memory_bytes: u64,
+    shared_memory_bytes: u64,
+    db_file_size_bytes: u64,
+    inserts_count: u64,
+    deletes_count: u64,
+    insert_rate: f64,
+    delete_rate: f64,
+    generated_event_count: u64,
+}
+
+fn setup_csv_writer() -> csv::Writer<std::fs::File> {
+    let writer = csv::WriterBuilder::new()
+        .from_path("out.txt")
+        .expect("couldn't open output file");
+    writer
+}
+
 async fn db_test() -> std::result::Result<(), Box<dyn Error>> {
+    // counters for db operations
+    let insert_count = Arc::new(AtomicU64::new(0));
+    let delete_count = Arc::new(AtomicU64::new(0));
+
+    // counter for events generated
+    let generated_count = Arc::new(AtomicU64::new(0));
+
+    let mut writer = setup_csv_writer();
+
     let (mut feeder_tx, mut feeder_rx) = mpsc::channel(1000);
 
     // TODO this channel either needs to be unbounded or we need to use separate channels
@@ -47,7 +81,13 @@ async fn db_test() -> std::result::Result<(), Box<dyn Error>> {
     // IN:  from MAIN - Insert DbEvents -
     //      from SINK - Delete DbEvents - after SINK confirms receipt of event in external system, delete event out of storage.
     // OUT: to SINK   - send recorded events to external sink
-    let db_thread = create_db_thread(db_rx, log_sink_tx, conn);
+    let db_thread = create_db_thread(
+        db_rx,
+        log_sink_tx,
+        insert_count.clone(),
+        delete_count.clone(),
+        conn,
+    );
 
     // THREAD: Log Sink (SINK)
     // PURPOSE: send out log messages to an external system. Get confirmation of recript and signal DW.
@@ -55,31 +95,39 @@ async fn db_test() -> std::result::Result<(), Box<dyn Error>> {
     // OUT: to DW  - delete message (successfully sent out)
     let sink_thread = create_log_sink_thread(sink_to_db, log_sink_rx);
 
+    // THREAD: Periodic stats gathering
+    let stats_timer = start_stats_timer(
+        generated_count.clone(),
+        insert_count.clone(),
+        delete_count.clone(),
+        writer,
+    );
+
     //MAIN THREAD: emulate the ZMQ PULL socket (SOCKET)
+    let mut gen_interval = tokio::time::interval(Duration::from_millis(1));
 
     // let mut file2 = File::open("input100k.txt").await?;
-    let mut file2 = File::open("input100k.txt").await?;
-    let reader = BufReader::new(file2);
-    let mut stream = reader.lines();
 
-    let mut i = 0usize;
-    while let Some(l) = stream
-        .next_line()
-        .await
-        .expect("reading from cursor won't fail")
-    {
-        let ie: InputEvent = serde_json::from_str(&l)?;
-        let ie_bytes = bincode::serialize(&ie)?;
-        if i % 1000 == 0 {
-            println!("Generating logging event -  id {}, #{}", &ie.ray_id, &i);
-        }
+    loop {
+        let mut file2 = File::open("input100k.txt").await?;
+        let reader = BufReader::new(file2);
+        let mut stream = reader.lines();
+        while let Some(l) = stream
+            .next_line()
+            .await
+            .expect("reading from cursor won't fail")
+        {
+            gen_interval.tick().await;
+            let i = generated_count.fetch_add(1, Ordering::Relaxed);
+            let ie: InputEvent = serde_json::from_str(&l)?;
+            let ie_bytes = bincode::serialize(&ie)?;
+            if i % 1000 == 0 {
+                println!("Generating logging event -  id {}, #{}", &ie.ray_id, &i);
+            }
 
-        // TODO slow the input down a little
-        std::thread::sleep_ms(1);
-        // tokio::task::yield_now();
-        i += 1;
-        if let Err(e) = feeder_tx.send(ChannelMsg::Msg(Bytes(ie_bytes))).await {
-            println!("error sending generated data to SOCKET READ thread: {}", e);
+            if let Err(e) = feeder_tx.send(ChannelMsg::Msg(Bytes(ie_bytes))).await {
+                println!("error sending generated data to SOCKET READ thread: {}", e);
+            }
         }
     }
 
@@ -89,6 +137,81 @@ async fn db_test() -> std::result::Result<(), Box<dyn Error>> {
     tokio::join!(sink_thread, socket_read_thread, db_thread);
 
     Ok(())
+}
+
+fn start_stats_timer(
+    generated_count: Arc<AtomicU64>,
+    insert_count: Arc<AtomicU64>,
+    delete_count: Arc<AtomicU64>,
+    mut writer: csv::Writer<std::fs::File>,
+) -> JoinHandle<()> {
+    let tick_time_ms = 30000;
+    let tick_time_sec = tick_time_ms as f64 / 1000f64;
+
+    tokio::spawn(async move {
+        let me = Process::myself().expect("unable to load self process");
+        let db_file = File::open("./test.db")
+            .await
+            .expect("unable to open db file");
+
+        let mut interval = tokio::time::interval(Duration::from_millis(tick_time_ms));
+
+        let mut i = 0u64;
+        let mut inserts_prev = 0f64;
+        let mut deletes_prev = 0f64;
+        loop {
+            interval.tick().await;
+            i += 1;
+
+            let inserts = insert_count.load(Ordering::Relaxed) as f64;
+            let insert_rate = (inserts - inserts_prev) / tick_time_sec;
+            inserts_prev = inserts;
+
+            let deletes = delete_count.load(Ordering::Relaxed) as f64;
+            let delete_rate = (deletes - deletes_prev) / tick_time_sec;
+            deletes_prev = deletes;
+
+            print_mem(&me);
+
+            let (vm, rss, shared) = if let Ok(status) = me.status() {
+                (
+                    status.vmsize.expect("vmsize") * 1024,
+                    status.vmrss.expect("vmrss") * 1024,
+                    status.rssfile.expect("rssfile") * 1024
+                        + status.rssshmem.expect("rssshmem") * 1024,
+                )
+            } else {
+                (0, 0, 0)
+            };
+
+            let stats = StatRec {
+                time: i * tick_time_sec as u64,
+                virtual_memory_bytes: vm,
+                resident_memory_bytes: rss,
+                shared_memory_bytes: shared,
+                db_file_size_bytes: db_file
+                    .metadata()
+                    .await
+                    .expect("failed to get db file size")
+                    .len(),
+                inserts_count: inserts as u64,
+                deletes_count: deletes as u64,
+                insert_rate: insert_rate,
+                delete_rate: delete_rate,
+                generated_event_count: generated_count.load(Ordering::Relaxed),
+            };
+
+            writer.serialize(stats);
+            writer.flush();
+
+            println!("DB file size: {}", db_file.metadata().await.unwrap().len());
+
+            println!("Inserts: {}", &inserts);
+            println!("Inserts/sec: {}", &insert_rate);
+            println!("Deletes: {}", &deletes);
+            println!("Deletes/sec: {}", &delete_rate);
+        }
+    })
 }
 
 fn create_log_sink_thread(
@@ -109,9 +232,50 @@ fn create_log_sink_thread(
     })
 }
 
+fn print_mem(me: &Process) {
+    // let page_size = procfs::page_size().expect("Unable to determinte page size!") as u64;
+    // if let Ok(statm) = me.statm() {
+    //     println!("== Data from /proc/self/statm:");
+    //     println!(
+    //         "Total virtual memory used: {} pages ({} bytes)",
+    //         statm.size,
+    //         statm.size * page_size
+    //     );
+    //     println!(
+    //         "Total resident set: {} pages ({} byte)s",
+    //         statm.resident,
+    //         statm.resident * page_size
+    //     );
+    //     println!(
+    //         "Total shared memory: {} pages ({} bytes)",
+    //         statm.shared,
+    //         statm.shared * page_size
+    //     );
+    //     println!();
+    // }
+
+    if let Ok(status) = me.status() {
+        println!("== Data from /proc/self/status:");
+        println!(
+            "Total virtual memory used: {} bytes",
+            status.vmsize.expect("vmsize") * 1024
+        );
+        println!(
+            "Total resident set: {} bytes",
+            status.vmrss.expect("vmrss") * 1024
+        );
+        println!(
+            "Total shared memory: {} bytes",
+            status.rssfile.expect("rssfile") * 1024 + status.rssshmem.expect("rssshmem") * 1024
+        );
+    }
+}
+
 fn create_db_thread(
     mut db_rx: UnboundedReceiver<DbAction>,
     mut log_sink_tx: Sender<ChannelMsg<LogEvent>>,
+    mut insert_count: Arc<AtomicU64>,
+    mut delete_count: Arc<AtomicU64>,
     conn: Connection,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -138,9 +302,10 @@ fn create_db_thread(
                     }
                 }
                 DbAction::Insert(le) => {
+                    insert_count.fetch_add(1, Ordering::Relaxed);
                     i += 1;
                     if i % 100 == 0 {
-                        println!("DB - processing event {} - #{}", le.ray_id, &i);
+                        // println!("DB - processing event {} - #{}", le.ray_id, &i);
                     }
                     conn.execute(
                         "INSERT INTO LOG_EVENTS (ray_id, data) VALUES (?1, ?2)",
@@ -148,15 +313,16 @@ fn create_db_thread(
                     )
                     .unwrap();
                     if let Err(e) = log_sink_tx.send(ChannelMsg::Msg(le)).await {
-                        println!("Log message not send to LOG SINK thread: {}", e);
+                        println!("Log message not sent to LOG SINK thread: {}", e);
                     }
                 }
                 DbAction::Delete(ray_id) => {
+                    delete_count.fetch_add(1, Ordering::Relaxed);
                     conn.execute("DELETE from LOG_EVENTS where ray_id = ?1", params![ray_id])
                         .unwrap();
                     i += 1;
                     if i % 100 == 0 {
-                        println!("DB - ACK {} - #{}", &ray_id, &i);
+                        // println!("DB - ACK {} - #{}", &ray_id, &i);
                     }
                 } //println!("DB - deleting entry for ray_id {}", ray_id)
             }
