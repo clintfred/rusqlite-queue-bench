@@ -1,14 +1,12 @@
-use csv::Writer;
 use procfs::process::Process;
 use rand::Rng;
 use rand::RngCore;
 use rusqlite::{params, Connection, Result};
 use serde::*;
 use std::error::Error;
-use std::io::{BufRead, LineWriter, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::fs::File;
 use tokio::io::BufReader;
 use tokio::prelude::*;
@@ -52,16 +50,16 @@ async fn db_test() -> std::result::Result<(), Box<dyn Error>> {
     // counter for events generated
     let generated_count = Arc::new(AtomicU64::new(0));
 
-    let mut writer = setup_csv_writer();
+    let writer = setup_csv_writer();
 
-    let (mut feeder_tx, mut feeder_rx) = mpsc::channel(1000);
+    let (mut feeder_tx, feeder_rx) = mpsc::channel(3000);
 
     // TODO this channel either needs to be unbounded or we need to use separate channels
     // for ACKs and figure out how to keep deadlock from happening
-    let (mut db_tx, mut db_rx) = mpsc::unbounded_channel();
+    let (db_tx, db_rx) = mpsc::unbounded_channel();
 
-    let mut socket_to_db = db_tx.clone();
-    let mut sink_to_db = db_tx.clone();
+    let socket_to_db = db_tx.clone();
+    let sink_to_db = db_tx.clone();
 
     // THREAD: main thread pulling off ZMQ PULL socket (MAIN)
     // PURPOSE: decode bytes, create DbEvent, Send DbEvent to DB
@@ -69,10 +67,10 @@ async fn db_test() -> std::result::Result<(), Box<dyn Error>> {
     // OUT: to DB - DbEvent with id, decoded and raw bytes
     let socket_read_thread = create_read_socket_thread(feeder_rx, socket_to_db);
 
-    let (mut log_sink_tx, mut log_sink_rx) = mpsc::channel(5000);
+    let (log_sink_tx, log_sink_rx) = mpsc::channel(5000);
 
     let conn = Connection::open("./test.db")?;
-    if let Err(e) = create_rustqlite_table(&conn) {
+    if let Err(_e) = create_rustqlite_table(&conn) {
         println!("Skipping db creation... test.db already exists!")
     }
 
@@ -81,7 +79,7 @@ async fn db_test() -> std::result::Result<(), Box<dyn Error>> {
     // IN:  from MAIN - Insert DbEvents -
     //      from SINK - Delete DbEvents - after SINK confirms receipt of event in external system, delete event out of storage.
     // OUT: to SINK   - send recorded events to external sink
-    let db_thread = create_db_thread(
+    let _db_thread = create_db_thread(
         db_rx,
         log_sink_tx,
         insert_count.clone(),
@@ -93,10 +91,10 @@ async fn db_test() -> std::result::Result<(), Box<dyn Error>> {
     // PURPOSE: send out log messages to an external system. Get confirmation of recript and signal DW.
     // IN: from DW - message to be sent out
     // OUT: to DW  - delete message (successfully sent out)
-    let sink_thread = create_log_sink_thread(sink_to_db, log_sink_rx);
+    let _sink_thread = create_log_sink_thread(sink_to_db, log_sink_rx);
 
     // THREAD: Periodic stats gathering
-    let stats_timer = start_stats_timer(
+    let _stats_timer = start_stats_timer(
         generated_count.clone(),
         insert_count.clone(),
         delete_count.clone(),
@@ -104,12 +102,12 @@ async fn db_test() -> std::result::Result<(), Box<dyn Error>> {
     );
 
     //MAIN THREAD: emulate the ZMQ PULL socket (SOCKET)
-    let mut gen_interval = tokio::time::interval(Duration::from_millis(1));
 
-    // let mut file2 = File::open("input100k.txt").await?;
-
+    // note that this the feeder_tx channel needs to be able to hold this many messages
+    let msgs_per_sec_target = 1000u64;
+    let mut start = Instant::now();
     loop {
-        let mut file2 = File::open("input100k.txt").await?;
+        let file2 = File::open("input100k.txt").await?;
         let reader = BufReader::new(file2);
         let mut stream = reader.lines();
         while let Some(l) = stream
@@ -117,26 +115,38 @@ async fn db_test() -> std::result::Result<(), Box<dyn Error>> {
             .await
             .expect("reading from cursor won't fail")
         {
-            gen_interval.tick().await;
             let i = generated_count.fetch_add(1, Ordering::Relaxed);
             let ie: InputEvent = serde_json::from_str(&l)?;
             let ie_bytes = bincode::serialize(&ie)?;
-            if i % 1000 == 0 {
+            if i % 10000 == 0 {
                 println!("Generating logging event -  id {}, #{}", &ie.ray_id, &i);
             }
 
             if let Err(e) = feeder_tx.send(ChannelMsg::Msg(Bytes(ie_bytes))).await {
                 println!("error sending generated data to SOCKET READ thread: {}", e);
             }
+
+            // after we have put out as many messages as we want to in 1 second
+            // calculate how long we need to wait to start generating the next
+            // second's worth of messages, and then wait for that duration
+            if i % msgs_per_sec_target == 0 {
+                let end = Instant::now();
+                let elapsed = end - start;
+                let time_until_next_iter = Duration::from_millis(1000) - elapsed;
+                // println!("delaying for {:?}", &time_until_next_iter);
+                tokio::time::delay_for(time_until_next_iter).await;
+                start = Instant::now(); // start time of the new "second"
+            }
         }
     }
 
-    if let Err(e) = feeder_tx.send(ChannelMsg::Poison).await {
-        println!("error sending POISON data to SOCKET READ thread: {}", e);
-    }
-    tokio::join!(sink_thread, socket_read_thread, db_thread);
+    // GRACEFUL SHUTDOWN DISABLED FOR NOW
+    // if let Err(e) = feeder_tx.send(ChannelMsg::Poison).await {
+    //     println!("error sending POISON data to SOCKET READ thread: {}", e);
+    // }
+    // tokio::join!(sink_thread, socket_read_thread, db_thread);
 
-    Ok(())
+    // Ok(())
 }
 
 fn start_stats_timer(
@@ -145,7 +155,7 @@ fn start_stats_timer(
     delete_count: Arc<AtomicU64>,
     mut writer: csv::Writer<std::fs::File>,
 ) -> JoinHandle<()> {
-    let tick_time_ms = 30000;
+    let tick_time_ms = 60000;
     let tick_time_sec = tick_time_ms as f64 / 1000f64;
 
     tokio::spawn(async move {
@@ -215,7 +225,7 @@ fn start_stats_timer(
 }
 
 fn create_log_sink_thread(
-    mut sink_to_db: UnboundedSender<DbAction>,
+    sink_to_db: UnboundedSender<DbAction>,
     mut log_sink_rx: Receiver<ChannelMsg<LogEvent>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -274,21 +284,21 @@ fn print_mem(me: &Process) {
 fn create_db_thread(
     mut db_rx: UnboundedReceiver<DbAction>,
     mut log_sink_tx: Sender<ChannelMsg<LogEvent>>,
-    mut insert_count: Arc<AtomicU64>,
-    mut delete_count: Arc<AtomicU64>,
+    insert_count: Arc<AtomicU64>,
+    delete_count: Arc<AtomicU64>,
     conn: Connection,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let start_time = std::time::Instant::now();
         let mut i = 0usize;
-        while let Some(db_action) = db_rx.recv().await {
+        while let Some(db_action) = db_rx.next().await {
             match db_action {
                 DbAction::Poison => {
                     println!(
                         "DB - POISON EVENT received. Waiting for final ACK to close rx channel..."
                     );
                     println!("DB - SENDING POISON to LOG SINK...");
-                    if let Err(e) = log_sink_tx.send(ChannelMsg::Poison).await {
+                    if let Err(_e) = log_sink_tx.send(ChannelMsg::Poison).await {
                         println!("DB - Failed to send POISON to LOG SINK");
                         db_rx.close();
                     } else {
@@ -358,7 +368,7 @@ fn create_db_thread(
 
 fn create_read_socket_thread(
     mut feeder_rx: Receiver<ChannelMsg<Bytes>>,
-    mut socket_to_db: UnboundedSender<DbAction>,
+    socket_to_db: UnboundedSender<DbAction>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(ChannelMsg::Msg(Bytes(socket_bytes))) = feeder_rx.recv().await {
@@ -403,9 +413,9 @@ fn create_rustqlite_table(conn: &Connection) -> Result<()> {
 }
 
 pub async fn gen_input() -> std::result::Result<(), Box<dyn Error>> {
-    let mut file = File::create("poem.txt").await?;
+    let mut file = File::create("input.txt").await?;
 
-    for i in 0..10000usize {
+    for _i in 0..10000usize {
         let msg_len = rand::thread_rng().gen_range(250, 2500);
         let mut msg = vec![0u8; msg_len];
         rand::thread_rng().fill_bytes(&mut msg);
@@ -414,21 +424,9 @@ pub async fn gen_input() -> std::result::Result<(), Box<dyn Error>> {
         file.write_all(b"\n").await?;
     }
 
-    // file.write_all(&serde_json::to_vec(&e)?).await?;
-    // file.write_all(b"\n").await?;
-    // file.write_all(b"aasdfasdf\n").await?;
-    // file.write_all(b"asdsdfasdf\n").await?;
-    // file.write_all(b"asdgfdgfasdf\n").await?;
-    // file.write_all(b"asdfasggfdf\n").await?;
-    // file.write_all(b"asdfassadfdf\n").await?;
-    // file.write_all(b"asdfaasdfsdf\n").await?;
-    // file.write_all(b"asdfasdf\n").await?;
-    // file.write_all(b"asdfasasdfdf\n").await?;
-    // file.write_all(b"asdfasdaf\n").await?;
-
     file.sync_all().await?;
 
-    let mut file2 = File::open("poem.txt").await?;
+    let file2 = File::open("input.txt").await?;
     let reader = BufReader::new(file2);
     let mut stream = reader.lines();
 
@@ -448,7 +446,6 @@ pub async fn gen_input() -> std::result::Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn write_to_db() {}
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct LogEvent {
     id: i64,
